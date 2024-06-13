@@ -32,8 +32,8 @@ def collect_code_files(root_dir, output_file, extensions=None, skip_dirs=None):
                         print(f"Failed to read {file_path}: {e}")
 
 
-root_directory = "C:/Users/jarem/python-projects/django-goals"  # Adjust as needed
-output_filename = "C:/Users/jarem/python-projects/consolidate-codebase/codebase_backend.txt"
+root_directory = ""  # Adjust as needed
+output_filename = ""
 file_extensions = [".py", ".tsx", ".ts", ".js", ".mjs", ".css", ".html"]  # Add file extensions as needed
 skip_directories = ["frontend", "__pycache__", "node_modules", ".next", "staticdir"]  # Directories to skip
 
