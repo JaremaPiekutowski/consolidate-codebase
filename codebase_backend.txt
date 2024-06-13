@@ -1,0 +1,1259 @@
+
+
+--- C:/Users/jarem/python-projects/django-goals\manage.py ---
+
+#!/usr/bin/env python
+"""Django's command-line utility for administrative tasks."""
+import os
+import sys
+
+from django.core.management import execute_from_command_line
+
+
+def main():
+    """Run administrative tasks."""
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'example_project.settings')
+    execute_from_command_line(sys.argv)
+
+
+if __name__ == '__main__':
+    main()
+
+
+--- C:/Users/jarem/python-projects/django-goals\django_goals\admin.py ---
+
+import json
+
+from django.contrib import admin, messages
+from django.utils.html import format_html
+from django.utils.translation import gettext as _
+from django_object_actions import DjangoObjectActions, action
+
+from .models import Goal, GoalDependency, GoalProgress
+
+
+class GoalDependencyInline(admin.TabularInline):
+    model = GoalDependency
+    fk_name = 'dependent_goal'
+    extra = 0
+    fields = (
+        'precondition_goal',
+        'precondition_goal__state',
+        'precondition_goal__handler',
+        'precondition_goal__created_at',
+    )
+    readonly_fields = fields
+
+    def has_add_permission(self, request, obj):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    @admin.display(description='Precondition Goal State')
+    def precondition_goal__state(self, obj):
+        return obj.precondition_goal.get_state_display()
+
+    @admin.display(description='Precondition Goal Handler')
+    def precondition_goal__handler(self, obj):
+        return obj.precondition_goal.handler
+
+    @admin.display(description='Precondition Goal Created At')
+    def precondition_goal__created_at(self, obj):
+        return obj.precondition_goal.created_at
+
+
+class GoalProgressInline(admin.TabularInline):
+    model = GoalProgress
+    extra = 0
+
+    def has_add_permission(self, request, obj):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(Goal)
+class GoalAdmin(DjangoObjectActions, admin.ModelAdmin):
+    list_display = ('id', 'state', 'handler', 'precondition_date', 'created_at')
+    list_filter = ('state', 'precondition_date')
+    search_fields = ('id',)
+
+    fields = (
+        'id',
+        'state',
+        'handler',
+        'instructions_pre',
+        'precondition_date',
+        'created_at',
+    )
+    inlines = (
+        GoalDependencyInline,
+        GoalProgressInline,
+    )
+    change_actions = (
+        'retry',
+        'block',
+        'unblock',
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    @admin.display(description='Instructions')
+    def instructions_pre(self, obj):
+        return format_html(
+            '<pre style="white-space: pre-wrap;">{}</pre>',
+            json.dumps(obj.instructions, indent=2),
+        )
+
+    @action(label=_('Retry'), methods=['POST'], button_type='form')
+    def retry(self, request, obj):
+        try:
+            obj.retry()
+        except ValueError as e:
+            self.message_user(request, str(e), level=messages.ERROR)
+        else:
+            self.message_user(request, _('Goal was retried'))
+
+    @action(label=_('Block'), methods=['POST'], button_type='form')
+    def block(self, request, obj):
+        try:
+            obj.block()
+        except ValueError as e:
+            self.message_user(request, str(e), level=messages.ERROR)
+        else:
+            self.message_user(request, _('Goal was blocked'))
+
+    @action(label=_('Unblock'), methods=['POST'], button_type='form')
+    def unblock(self, request, obj):
+        try:
+            obj.unblock()
+        except ValueError as e:
+            self.message_user(request, str(e), level=messages.ERROR)
+        else:
+            self.message_user(request, _('Goal was unblocked'))
+
+
+--- C:/Users/jarem/python-projects/django-goals\django_goals\apps.py ---
+
+from django.apps import AppConfig
+
+
+class DjangoGoalsConfig(AppConfig):
+    name = 'django_goals'
+
+
+--- C:/Users/jarem/python-projects/django-goals\django_goals\blocking_worker.py ---
+
+import logging
+
+from django.db import connection
+
+from .models import handle_waiting_for_worker_guarded
+
+
+logger = logging.getLogger(__name__)
+
+
+def worker():
+    logger.info("Blocking worker started, registering listener (goal_waiting_for_worker)")
+    listen_goal_waiting_for_worker()
+
+    logger.info("Executing work ready before we were listening")
+    while True:
+        did_a_thing = handle_waiting_for_worker_guarded()
+        if not did_a_thing:
+            break
+
+    logger.info("Handling notifications")
+    pg_conn = connection.connection
+    for _ in pg_conn.notifies():
+        # We might pick a different job than the one that was notified.
+        # This is okay, because there are as many (or more) notifications as there are jobs.
+        handle_waiting_for_worker_guarded()
+
+    logger.info("Blocking worker exiting now")
+
+
+def listen_goal_waiting_for_worker():
+    with connection.cursor() as cursor:
+        cursor.execute("LISTEN goal_waiting_for_worker")
+
+
+--- C:/Users/jarem/python-projects/django-goals\django_goals\blocking_worker_tests.py ---
+
+import pytest
+
+from .blocking_worker import listen_goal_waiting_for_worker
+from .models import schedule
+
+
+def noop():
+    pass
+
+
+@pytest.mark.django_db(transaction=True)
+def test_schedule_notifies(get_notifications):
+    listen_goal_waiting_for_worker()
+
+    goal = schedule(noop)
+
+    notifications = get_notifications()
+    assert len(notifications) == 1
+    notification = notifications[0]
+    assert notification.channel == 'goal_waiting_for_worker'
+    assert notification.payload == str(goal.id)
+
+
+--- C:/Users/jarem/python-projects/django-goals\django_goals\conftest.py ---
+
+from unittest import mock
+
+import pytest
+from django.db import connection
+
+from .factories import GoalFactory
+
+
+@pytest.fixture(name='goal')
+def goal_fixture(request):
+    return GoalFactory(
+        **getattr(request, 'param', {}),
+    )
+
+
+@pytest.fixture(name='get_notifications')
+def get_notifications_fixture():
+    handler = mock.Mock()
+    pg_conn = connection.connection
+    pg_conn.add_notify_handler(handler)
+
+    def _get_notifications():
+        return [
+            call[0][0]
+            for call in handler.call_args_list
+        ]
+    return _get_notifications
+
+
+--- C:/Users/jarem/python-projects/django-goals\django_goals\factories.py ---
+
+import factory
+
+from .models import Goal
+
+
+class GoalFactory(factory.django.DjangoModelFactory):
+    class Meta:
+        model = Goal
+        skip_postgeneration_save = True
+
+    @factory.post_generation
+    def precondition_goals(self, create, extracted, **kwargs):
+        if not create:
+            return
+
+        if extracted:
+            self.precondition_goals.set(extracted)
+
+
+--- C:/Users/jarem/python-projects/django-goals\django_goals\models.py ---
+
+import datetime
+import inspect
+import logging
+import time
+import uuid
+
+from django.db import connections, models, transaction
+from django.utils import timezone
+from django.utils.module_loading import import_string
+from django.utils.translation import gettext_lazy as _
+
+
+logger = logging.getLogger(__name__)
+
+
+class GoalState(models.TextChoices):
+    # Goal is explicitly marked not to be pursued
+    BLOCKED = 'blocked'
+    # Goal cannot be pursued yet, because it is allowed only after future date
+    WAITING_FOR_DATE = 'waiting_for_date'
+    # Goal cannot be pursued yet, because other goals need to be achieved first
+    WAITING_FOR_PRECONDITIONS = 'waiting_for_preconditions'
+    # Goal is ready to be pursued. We are waiting for a worker to pick it up
+    WAITING_FOR_WORKER = 'waiting_for_worker'
+    # The goal has been achieved
+    ACHIEVED = 'achieved'
+    # Too many failed attempts when pursuing the goal
+    GIVEN_UP = 'given_up'
+    # transaction error happened during execution, so we cant even properly store failure
+    CORRUPTED = 'corrupted'
+    # Goal is waiting on a precondition that wont be achieved
+    NOT_GOING_TO_HAPPEN_SOON = 'not_going_to_happen_soon'
+
+
+class Goal(models.Model):
+    """
+    Goal represents a state we want to achieve.
+    Goal will be pursued by calling a handler function.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    state = models.CharField(
+        max_length=30,
+        db_index=True,
+        choices=GoalState.choices,
+        default=GoalState.WAITING_FOR_DATE,
+    )
+    handler = models.CharField(max_length=100)
+    instructions = models.JSONField(null=True)
+    precondition_date = models.DateTimeField(
+        default=timezone.now,
+        help_text=_(
+            'Goal will not be pursued before this date. '
+            'Also used as priority for goals that are waiting for worker - '
+            'goals with earlier date will be preferred.'
+        ),
+    )
+    precondition_goals = models.ManyToManyField(
+        to='self',
+        symmetrical=False,
+        related_name='dependent_goals',
+        through='GoalDependency',
+        blank=True,
+    )
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        ordering = ('-created_at',)
+        indexes = [
+            models.Index(
+                fields=['precondition_date'],
+                condition=models.Q(state=GoalState.WAITING_FOR_DATE),
+                name='goals_waiting_for_date_idx',
+            ),
+            models.Index(
+                fields=['precondition_date'],
+                condition=models.Q(state=GoalState.WAITING_FOR_WORKER),
+                name='goals_waiting_for_worker_idx',
+            ),
+        ]
+
+    def block(self):
+        if self.state not in (GoalState.WAITING_FOR_DATE, GoalState.WAITING_FOR_PRECONDITIONS):
+            raise ValueError(f'Cannot block goal in state {self.state}')
+        self.state = GoalState.BLOCKED
+        self.save(update_fields=['state'])
+
+    def unblock(self):
+        if self.state != GoalState.BLOCKED:
+            raise ValueError(f'Cannot unblock goal in state {self.state}')
+        self.state = GoalState.WAITING_FOR_DATE
+        self.save(update_fields=['state'])
+        Goal.objects.filter(
+            id__in=get_dependent_goal_ids([self.id]),
+            state=GoalState.NOT_GOING_TO_HAPPEN_SOON,
+        ).update(state=GoalState.WAITING_FOR_DATE)
+
+    def retry(self):
+        if self.state not in (GoalState.GIVEN_UP, GoalState.CORRUPTED):
+            raise ValueError(f'Cannot retry goal in state {self.state}')
+        self.state = GoalState.WAITING_FOR_DATE
+        self.save(update_fields=['state'])
+        dependent_goal_ids = get_dependent_goal_ids([self.id])
+        Goal.objects.filter(
+            id__in=dependent_goal_ids,
+            state=GoalState.NOT_GOING_TO_HAPPEN_SOON,
+        ).update(state=GoalState.WAITING_FOR_DATE)
+        return dependent_goal_ids
+
+
+class GoalDependency(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    dependent_goal = models.ForeignKey(
+        to=Goal,
+        on_delete=models.CASCADE,
+        related_name='dependencies',
+    )
+    precondition_goal = models.ForeignKey(
+        to=Goal,
+        on_delete=models.PROTECT,
+        related_name='dependents',
+    )
+
+    class Meta:
+        unique_together = (
+            ('dependent_goal', 'precondition_goal'),
+        )
+
+
+class GoalProgress(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    goal = models.ForeignKey(Goal, on_delete=models.CASCADE, related_name='progress')
+    success = models.BooleanField()
+    created_at = models.DateTimeField(default=timezone.now)
+    time_taken = models.DurationField(null=True)
+
+    class Meta:
+        ordering = ('goal', '-created_at')
+
+
+def worker(stop_event):
+    logger.info('Busy-wait worker started')
+    while not stop_event.is_set():
+        now = timezone.now()
+        transitions_done = worker_turn(now)
+        if transitions_done == 0:
+            # nothing could be done, let's go to sleep
+            logging.debug('Nothing to do, sleeping for a bit')
+            time.sleep(1)
+    logger.info('Busy-wait worker exiting')
+
+
+def worker_turn(now):
+    transitions_done = 0
+    transitions_done += handle_waiting_for_date(now)
+    transitions_done += handle_waiting_for_preconditions()
+    while True:
+        did_a_thing = handle_waiting_for_worker_guarded()
+        if not did_a_thing:
+            break
+        transitions_done += 1
+    return transitions_done
+
+
+def handle_waiting_for_worker_guarded():
+    """
+    Wrapper to catch exceptions and mark goal as corrupted when it happens.
+    Some exceptions might be caought and handled by the inner function,
+    but transaction management error for example is not recoverable there.
+    We need to catch it outside transaction.
+    """
+    try:
+        return handle_waiting_for_worker()
+    except Exception as e:  # pylint: disable=broad-except
+        logger.exception('Worker failed')
+        _handle_corrupted_progress(e)
+        return True
+
+
+def _handle_corrupted_progress(exc):
+    # retrieve goal from the traceback and mark it as corrupted
+    traceback = exc.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if frame.f_code.co_name == 'handle_waiting_for_worker':
+            break
+        traceback = traceback.tb_next
+    goal = frame.f_locals['goal']
+    with transaction.atomic():
+        Goal.objects.filter(id=goal.id).update(state=GoalState.CORRUPTED)
+        notify_goal_progress(goal.id, GoalState.CORRUPTED)
+
+
+def handle_waiting_for_date(now):
+    return Goal.objects.filter(
+        state=GoalState.WAITING_FOR_DATE,
+        precondition_date__lte=now,
+    ).update(state=GoalState.WAITING_FOR_PRECONDITIONS)
+
+
+def handle_waiting_for_preconditions():
+    transitions_done = 0
+
+    with transaction.atomic():
+        new_waiting_for_worker = Goal.objects.filter(
+            state=GoalState.WAITING_FOR_PRECONDITIONS,
+        ).annotate(
+            num_preconditions=models.Count('precondition_goals'),
+            num_achieved_preconditions=models.Count('precondition_goals', filter=models.Q(
+                precondition_goals__state=GoalState.ACHIEVED,
+            )),
+        ).filter(
+            num_preconditions=models.F('num_achieved_preconditions'),
+        )
+        # we need separate query to lock rows, because GROUP BY is not allowed with FOR UPDATE
+        new_waiting_for_worker = Goal.objects.filter(
+            id__in=new_waiting_for_worker,
+        ).select_for_update(
+            skip_locked=True,
+            no_key=True,
+        ).values_list('id', flat=True)
+        new_waiting_for_worker = list(new_waiting_for_worker)
+        if new_waiting_for_worker:
+            Goal.objects.filter(id__in=new_waiting_for_worker).update(state=GoalState.WAITING_FOR_WORKER)
+            with connections['default'].cursor() as cursor:
+                for goal_id in new_waiting_for_worker:
+                    notify_goal_waiting_for_worker(cursor, goal_id)
+        transitions_done += len(new_waiting_for_worker)
+
+    # if a goal is waiting for preconditions that are not going to happen soon, it's not going to happen soon either
+    transitions_done += Goal.objects.filter(
+        state=GoalState.WAITING_FOR_PRECONDITIONS,
+        precondition_goals__state__in=(
+            GoalState.BLOCKED,
+            GoalState.GIVEN_UP,
+            GoalState.CORRUPTED,
+            GoalState.NOT_GOING_TO_HAPPEN_SOON,
+        ),
+    ).update(state=GoalState.NOT_GOING_TO_HAPPEN_SOON)
+
+    return transitions_done
+
+
+@transaction.atomic
+def handle_waiting_for_worker():
+    now = timezone.now()
+    goal = Goal.objects.filter(state=GoalState.WAITING_FOR_WORKER).order_by(
+        'precondition_date',
+    ).select_for_update(
+        skip_locked=True,
+        no_key=True,
+    ).first()
+    if goal is None:
+        # nothing to do
+        return False
+
+    logger.info('Just about to pursue goal %s: %s', goal.id, goal.handler)
+    start_time = time.monotonic()
+    try:
+        ret = follow_instructions(goal)
+
+    except Exception:  # pylint: disable=broad-except
+        logger.exception('Goal %s failed', goal.id)
+        success = False
+        failure_index = goal.progress.filter(success=False).count()
+        retry_delay = get_retry_delay(failure_index)
+        if retry_delay is None:
+            goal.state = GoalState.GIVEN_UP
+        else:
+            goal.state = GoalState.WAITING_FOR_DATE
+            goal.precondition_date = now + retry_delay
+
+    else:
+        if isinstance(ret, RetryMeLater):
+            logger.info('Goal %s needs to be retried later', goal.id)
+            success = True
+            goal.state = GoalState.WAITING_FOR_DATE
+            # move scheduled time forward to avoid starving other goals, in the case this one wants to be retried often
+            goal.precondition_date = now
+            goal.precondition_goals.add(*ret.precondition_goals)
+
+        elif isinstance(ret, AllDone):
+            logger.info('Goal %s was achieved', goal.id)
+            success = True
+            goal.state = GoalState.ACHIEVED
+
+        else:
+            logger.warning('Goal %s handler returned unknown value, which is ignored', goal.id)
+            success = True
+            goal.state = GoalState.ACHIEVED
+
+    time_taken = time.monotonic() - start_time
+
+    GoalProgress.objects.create(
+        goal=goal,
+        success=success,
+        created_at=now,
+        time_taken=datetime.timedelta(seconds=time_taken),
+    )
+    goal.save(update_fields=['state', 'created_at', 'precondition_date'])
+    notify_goal_progress(goal.id, goal.state)
+    return True
+
+
+def follow_instructions(goal):
+    func = import_string(goal.handler)
+    instructions = goal.instructions
+    return func(goal, *instructions['args'], **instructions['kwargs'])
+
+
+def get_retry_delay(failure_index):
+    max_failures = 3
+    if failure_index >= max_failures:
+        return None
+    return datetime.timedelta(seconds=10) * (2 ** failure_index)
+
+
+class RetryMeLater:
+    """
+    Like a process yielding in operating system.
+    """
+    def __init__(self, precondition_goals=()):
+        self.precondition_goals = precondition_goals
+
+
+class AllDone:
+    pass
+
+
+def schedule(
+    func, args=None, kwargs=None,
+    precondition_date=None, precondition_goals=None, blocked=False,
+    listen=False,
+):
+    state = GoalState.WAITING_FOR_DATE
+    if args is None:
+        args = []
+    if kwargs is None:
+        kwargs = {}
+    if precondition_date is None:
+        precondition_date = timezone.now()
+        state = GoalState.WAITING_FOR_PRECONDITIONS
+    if precondition_goals is None:
+        precondition_goals = []
+    if (
+        not precondition_goals and
+        state == GoalState.WAITING_FOR_PRECONDITIONS
+    ):
+        state = GoalState.WAITING_FOR_WORKER
+    if blocked:
+        state = GoalState.BLOCKED
+    func_name = inspect.getmodule(func).__name__ + '.' + func.__name__
+
+    goal = Goal(
+        state=state,
+        handler=func_name,
+        instructions={
+            'args': args,
+            'kwargs': kwargs,
+        },
+        precondition_date=precondition_date,
+    )
+    if listen:
+        listen_goal_progress(goal.id)
+
+    with transaction.atomic():
+        goal.save()
+        goal.precondition_goals.set(precondition_goals)
+        if state == GoalState.WAITING_FOR_WORKER:
+            with connections['default'].cursor() as cursor:
+                notify_goal_waiting_for_worker(cursor, goal.id)
+
+    return goal
+
+
+def notify_goal_waiting_for_worker(cursor, goal_id):
+    cursor.execute("NOTIFY goal_waiting_for_worker, %s", [str(goal_id)])
+
+
+def notify_goal_progress(goal_id, state):
+    with connections['default'].cursor() as cursor:
+        channel = get_goal_progress_channel(goal_id)
+        cursor.execute(f"NOTIFY {channel}, %s", [
+            state,
+        ])
+
+
+def listen_goal_progress(goal_id):
+    with connections['default'].cursor() as cursor:
+        channel = get_goal_progress_channel(goal_id)
+        cursor.execute(f'LISTEN {channel}')
+
+
+def get_goal_progress_channel(goal_id):
+    return f'goal_progress_{goal_id.hex}'
+
+
+def wait():
+    pg_conn = connections['default'].connection
+    notification_generator = pg_conn.notifies()
+    for notification in notification_generator:
+        notification_generator.close()
+    return notification  # pylint: disable=undefined-loop-variable
+
+
+def get_dependent_goal_ids(goal_ids):
+    goal_ids = list(goal_ids)
+    qs = GoalDependency.objects.raw(
+        '''
+        WITH RECURSIVE dependent_goals AS (
+            SELECT id FROM django_goals_goal
+            WHERE id = ANY(%(goal_ids)s)
+        UNION
+            SELECT django_goals_goal.id
+            FROM django_goals_goal
+            JOIN django_goals_goaldependency
+            ON django_goals_goal.id = django_goals_goaldependency.dependent_goal_id
+            JOIN dependent_goals
+            ON django_goals_goaldependency.precondition_goal_id = dependent_goals.id
+        )
+        SELECT id FROM dependent_goals
+        ''',
+        {'goal_ids': goal_ids},
+    )
+    return [obj.id for obj in qs]
+
+
+--- C:/Users/jarem/python-projects/django-goals\django_goals\models_tests.py ---
+
+import pytest
+
+from .factories import GoalFactory
+from .models import GoalState, get_dependent_goal_ids
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'goal',
+    [{'state': GoalState.GIVEN_UP}],
+    indirect=True,
+)
+def test_retry(goal):
+    goal.retry()
+    assert goal.state == GoalState.WAITING_FOR_DATE
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('goal', [{'state': GoalState.GIVEN_UP}], indirect=True)
+def test_retry_dependent_on(goal):
+    next_goal = GoalFactory(
+        state=GoalState.NOT_GOING_TO_HAPPEN_SOON,
+        precondition_goals=[goal],
+    )
+    altered_ids = goal.retry()
+    assert next_goal.id in altered_ids
+    next_goal.refresh_from_db()
+    assert next_goal.state == GoalState.WAITING_FOR_DATE
+
+
+@pytest.mark.django_db
+def test_get_dependent_goal_ids(goal):
+    next_goal = GoalFactory(precondition_goals=[goal])
+    assert next_goal.id in get_dependent_goal_ids([goal.pk])
+    assert goal.id not in get_dependent_goal_ids([next_goal.pk])
+
+
+--- C:/Users/jarem/python-projects/django-goals\django_goals\worker_tests.py ---
+
+import datetime
+from unittest import mock
+
+import pytest
+from django.utils import timezone
+
+from .blocking_worker import listen_goal_waiting_for_worker
+from .factories import GoalFactory
+from .models import (
+    Goal, GoalState, RetryMeLater, handle_waiting_for_preconditions,
+    handle_waiting_for_worker, schedule, worker_turn,
+)
+
+
+@pytest.mark.django_db
+def test_worker_turn_noop():
+    now = timezone.now()
+    transitions_done = worker_turn(now)
+    assert transitions_done == 0
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('goal', [
+    {'state': GoalState.WAITING_FOR_DATE},
+    {'state': GoalState.WAITING_FOR_PRECONDITIONS},
+    {'state': GoalState.WAITING_FOR_WORKER},
+    {'state': GoalState.ACHIEVED},
+    {'state': GoalState.GIVEN_UP},
+], indirect=True)
+def test_handle_waiting_for_worker_return_value(goal):
+    did_a_thing = handle_waiting_for_worker()
+    assert did_a_thing is (goal.state == GoalState.WAITING_FOR_WORKER)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('goal', [{
+    'state': GoalState.WAITING_FOR_WORKER,
+    'handler': 'os.path.join',
+    'instructions': {
+        'args': [1, 2],
+        'kwargs': {'a': 'b'},
+    },
+}], indirect=True)
+def test_handle_waiting_for_worker_success(goal):
+    with mock.patch('os.path.join') as func:
+        func.return_value = {'aaa': 'im happy'}  # will be ignored
+        handle_waiting_for_worker()
+
+    assert func.call_count == 1
+    assert func.call_args == mock.call(goal, 1, 2, a='b')
+
+    goal.refresh_from_db()
+    assert goal.state == GoalState.ACHIEVED
+
+    progress = goal.progress.get()
+    assert progress.success
+    assert progress.time_taken > datetime.timedelta(0)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('goal', [{
+    'state': GoalState.WAITING_FOR_WORKER,
+    'precondition_date': timezone.now() - timezone.timedelta(days=1),
+}], indirect=True)
+def test_handle_waiting_for_worker_failure(goal):
+    now = timezone.now()
+    with mock.patch('django_goals.models.follow_instructions') as follow_instructions:
+        follow_instructions.side_effect = Exception
+        handle_waiting_for_worker()
+
+    goal.refresh_from_db()
+    assert goal.state == GoalState.WAITING_FOR_DATE
+    assert goal.precondition_date > now
+
+    progress = goal.progress.get()
+    assert not progress.success
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('goal', [{'state': GoalState.WAITING_FOR_WORKER}], indirect=True)
+def test_handle_waiting_for_worker_retry(goal):
+    other_goal = GoalFactory()
+    with mock.patch('django_goals.models.follow_instructions') as follow_instructions:
+        follow_instructions.return_value = RetryMeLater(
+            precondition_goals=[other_goal],
+        )
+        handle_waiting_for_worker()
+
+    goal.refresh_from_db()
+    assert goal.state == GoalState.WAITING_FOR_DATE
+    assert goal.precondition_goals.get() == other_goal
+
+    progress = goal.progress.get()
+    assert progress.success
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize('goal', [{
+    'state': GoalState.WAITING_FOR_PRECONDITIONS,
+}], indirect=True)
+@pytest.mark.parametrize(
+    ('precondition_goal_states', 'expected_state'),
+    [
+        ([], GoalState.WAITING_FOR_WORKER),
+        ([GoalState.ACHIEVED], GoalState.WAITING_FOR_WORKER),
+        ([GoalState.ACHIEVED, GoalState.ACHIEVED], GoalState.WAITING_FOR_WORKER),
+        ([GoalState.ACHIEVED, GoalState.GIVEN_UP], GoalState.NOT_GOING_TO_HAPPEN_SOON),
+        ([GoalState.WAITING_FOR_DATE], GoalState.WAITING_FOR_PRECONDITIONS),
+        ([GoalState.BLOCKED], GoalState.NOT_GOING_TO_HAPPEN_SOON),
+    ],
+)
+def test_handle_waiting_for_preconditions(goal, precondition_goal_states, expected_state, get_notifications):
+    precondition_goals = [
+        GoalFactory(state=state)
+        for state in precondition_goal_states
+    ]
+    goal.precondition_goals.set(precondition_goals)
+    listen_goal_waiting_for_worker()
+
+    handle_waiting_for_preconditions()
+
+    goal.refresh_from_db()
+    assert goal.state == expected_state
+
+    # notification was sent accordingly
+    notifications = get_notifications()
+    if expected_state == GoalState.WAITING_FOR_WORKER:
+        assert len(notifications) == 1
+        notification = notifications[0]
+        assert notification.channel == 'goal_waiting_for_worker'
+        assert notification.payload == str(goal.id)
+    else:
+        assert not notifications
+
+
+def trigger_database_error(goal):
+    Goal.objects.create(id=goal.id)  # violates unique constraint
+
+
+@pytest.mark.django_db(transaction=True)
+def test_transaction_error_in_goal():
+    goal = schedule(trigger_database_error)
+    worker_turn(timezone.now())
+    goal.refresh_from_db()
+    assert goal.state == GoalState.CORRUPTED
+
+
+--- C:/Users/jarem/python-projects/django-goals\django_goals\__init__.py ---
+
+
+
+--- C:/Users/jarem/python-projects/django-goals\django_goals\management\commands\goals_blocking_worker.py ---
+
+from django.core.management.base import BaseCommand
+
+from django_goals.blocking_worker import worker
+
+
+class Command(BaseCommand):
+    help = 'Run the blocking worker'
+
+    def handle(self, *args, **options):
+        worker()
+
+
+--- C:/Users/jarem/python-projects/django-goals\django_goals\management\commands\goals_busy_worker.py ---
+
+import signal
+import threading
+
+from django.core.management.base import BaseCommand
+
+from django_goals.models import worker
+
+
+class Command(BaseCommand):
+    help = 'Run the worker'
+
+    def handle(self, *args, **options):
+        stop_event = threading.Event()
+        signal.signal(signal.SIGINT, lambda signum, frame: stop_event.set())
+        signal.signal(signal.SIGTERM, lambda signum, frame: stop_event.set())
+        worker(stop_event)
+
+
+--- C:/Users/jarem/python-projects/django-goals\django_goals\management\commands\set_goal.py ---
+
+import time
+
+from django.core.management.base import BaseCommand
+
+from django_goals.models import AllDone, schedule, wait
+
+
+def pursue(goal):
+    return AllDone()
+
+
+class Command(BaseCommand):
+    help = 'Set an example goal'
+
+    def handle(self, *args, **options):
+        start_time = time.monotonic()
+        goal = schedule(pursue, listen=True)
+        print('Goal scheduled', goal.id)
+        notification = wait()
+        end_time = time.monotonic()
+        print('Goal done', notification, 'in', end_time - start_time, 'seconds')
+
+
+--- C:/Users/jarem/python-projects/django-goals\django_goals\management\commands\__init__.py ---
+
+
+
+--- C:/Users/jarem/python-projects/django-goals\django_goals\migrations\0001_initial.py ---
+
+# Generated by Django 5.0.6 on 2024-06-10 16:05
+
+import uuid
+
+import django.db.models.deletion
+import django.utils.timezone
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    initial = True
+
+    dependencies = [
+    ]
+
+    operations = [
+        migrations.CreateModel(
+            name='Goal',
+            fields=[
+                ('id', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
+                ('state', models.CharField(choices=[('blocked', 'Blocked'), ('waiting_for_date', 'Waiting For Date'), ('waiting_for_preconditions', 'Waiting For Preconditions'), ('waiting_for_worker', 'Waiting For Worker'), ('achieved', 'Achieved'), ('given_up', 'Given Up'), ('corrupted', 'Corrupted'), ('not_going_to_happen_soon', 'Not Going To Happen Soon')], db_index=True, default='waiting_for_date', max_length=30)),
+                ('handler', models.CharField(max_length=100)),
+                ('instructions', models.JSONField(null=True)),
+                ('precondition_date', models.DateTimeField(default=django.utils.timezone.now, help_text='Goal will not be pursued before this date. Also used as priority for goals that are waiting for worker - goals with earlier date will be preferred.')),
+                ('created_at', models.DateTimeField(db_index=True, default=django.utils.timezone.now)),
+            ],
+            options={
+                'ordering': ('-created_at',),
+            },
+        ),
+        migrations.CreateModel(
+            name='GoalDependency',
+            fields=[
+                ('id', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
+                ('dependent_goal', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='dependencies', to='django_goals.goal')),
+                ('precondition_goal', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='dependents', to='django_goals.goal')),
+            ],
+            options={
+                'unique_together': {('dependent_goal', 'precondition_goal')},
+            },
+        ),
+        migrations.AddField(
+            model_name='goal',
+            name='precondition_goals',
+            field=models.ManyToManyField(blank=True, related_name='dependent_goals', through='django_goals.GoalDependency', to='django_goals.goal'),
+        ),
+        migrations.CreateModel(
+            name='GoalProgress',
+            fields=[
+                ('id', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
+                ('success', models.BooleanField()),
+                ('created_at', models.DateTimeField(default=django.utils.timezone.now)),
+                ('time_taken', models.DurationField(null=True)),
+                ('goal', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='progress', to='django_goals.goal')),
+            ],
+            options={
+                'ordering': ('goal', '-created_at'),
+            },
+        ),
+        migrations.AddIndex(
+            model_name='goal',
+            index=models.Index(condition=models.Q(('state', 'waiting_for_date')), fields=['precondition_date'], name='goals_waiting_for_date_idx'),
+        ),
+        migrations.AddIndex(
+            model_name='goal',
+            index=models.Index(condition=models.Q(('state', 'waiting_for_worker')), fields=['precondition_date'], name='goals_waiting_for_worker_idx'),
+        ),
+    ]
+
+
+--- C:/Users/jarem/python-projects/django-goals\django_goals\migrations\__init__.py ---
+
+
+
+--- C:/Users/jarem/python-projects/django-goals\example_project\asgi.py ---
+
+"""
+ASGI config for example_project project.
+
+It exposes the ASGI callable as a module-level variable named ``application``.
+
+For more information on this file, see
+https://docs.djangoproject.com/en/5.0/howto/deployment/asgi/
+"""
+
+import os
+
+from django.core.asgi import get_asgi_application
+
+
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'example_project.settings')
+
+application = get_asgi_application()
+
+
+--- C:/Users/jarem/python-projects/django-goals\example_project\settings.py ---
+
+"""
+Django settings for example_project project.
+
+Generated by 'django-admin startproject' using Django 5.0.6.
+
+For more information on this file, see
+https://docs.djangoproject.com/en/5.0/topics/settings/
+
+For the full list of settings and their values, see
+https://docs.djangoproject.com/en/5.0/ref/settings/
+"""
+
+from pathlib import Path
+
+import environ
+
+
+# Build paths inside the project like this: BASE_DIR / 'subdir'.
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+env = environ.Env()
+environ.Env.read_env(str(BASE_DIR / '.env'))
+
+# Quick-start development settings - unsuitable for production
+# See https://docs.djangoproject.com/en/5.0/howto/deployment/checklist/
+
+# SECURITY WARNING: keep the secret key used in production secret!
+SECRET_KEY = env.str('SECRET_KEY')
+
+# SECURITY WARNING: don't run with debug turned on in production!
+DEBUG = env.bool('DEBUG', default=False)
+
+ALLOWED_HOSTS = []
+
+
+# Application definition
+
+INSTALLED_APPS = [
+    'django.contrib.admin',
+    'django.contrib.auth',
+    'django.contrib.contenttypes',
+    'django.contrib.sessions',
+    'django.contrib.messages',
+    'django.contrib.staticfiles',
+    'django_goals',
+]
+
+MIDDLEWARE = [
+    'django.middleware.security.SecurityMiddleware',
+    'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.middleware.common.CommonMiddleware',
+    'django.middleware.csrf.CsrfViewMiddleware',
+    'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'django.contrib.messages.middleware.MessageMiddleware',
+    'django.middleware.clickjacking.XFrameOptionsMiddleware',
+]
+
+ROOT_URLCONF = 'example_project.urls'
+
+TEMPLATES = [
+    {
+        'BACKEND': 'django.template.backends.django.DjangoTemplates',
+        'DIRS': [],
+        'APP_DIRS': True,
+        'OPTIONS': {
+            'context_processors': [
+                'django.template.context_processors.debug',
+                'django.template.context_processors.request',
+                'django.contrib.auth.context_processors.auth',
+                'django.contrib.messages.context_processors.messages',
+            ],
+        },
+    },
+]
+
+WSGI_APPLICATION = 'example_project.wsgi.application'
+
+
+# Database
+# https://docs.djangoproject.com/en/5.0/ref/settings/#databases
+
+DATABASES = {
+    'default': env.db('DATABASE_URL'),
+}
+
+
+# Password validation
+# https://docs.djangoproject.com/en/5.0/ref/settings/#auth-password-validators
+
+AUTH_PASSWORD_VALIDATORS = [
+    {
+        'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
+    },
+    {
+        'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
+    },
+    {
+        'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
+    },
+    {
+        'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
+    },
+]
+
+
+# Internationalization
+# https://docs.djangoproject.com/en/5.0/topics/i18n/
+
+LANGUAGE_CODE = 'en-us'
+
+TIME_ZONE = 'UTC'
+
+USE_I18N = True
+
+USE_TZ = True
+
+
+# Static files (CSS, JavaScript, Images)
+# https://docs.djangoproject.com/en/5.0/howto/static-files/
+
+STATIC_URL = 'static/'
+
+# Default primary key field type
+# https://docs.djangoproject.com/en/5.0/ref/settings/#default-auto-field
+
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'level': 'DEBUG',
+            'class': 'logging.StreamHandler',
+            'formatter': 'verbose',
+        },
+    },
+    'loggers': {
+        'django_goals': {
+            'handlers': ['console'],
+            'level': 'INFO',
+        },
+    },
+    'formatters': {
+        'verbose': {
+            'format': 'pid={process:d} {name} {levelname} {message}',
+            'style': '{',
+        },
+    },
+}
+
+
+--- C:/Users/jarem/python-projects/django-goals\example_project\urls.py ---
+
+"""
+URL configuration for example_project project.
+
+The `urlpatterns` list routes URLs to views. For more information please see:
+    https://docs.djangoproject.com/en/5.0/topics/http/urls/
+Examples:
+Function views
+    1. Add an import:  from my_app import views
+    2. Add a URL to urlpatterns:  path('', views.home, name='home')
+Class-based views
+    1. Add an import:  from other_app.views import Home
+    2. Add a URL to urlpatterns:  path('', Home.as_view(), name='home')
+Including another URLconf
+    1. Import the include() function: from django.urls import include, path
+    2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
+"""
+from django.contrib import admin
+from django.urls import path
+
+
+urlpatterns = [
+    path('admin/', admin.site.urls),
+]
+
+
+--- C:/Users/jarem/python-projects/django-goals\example_project\wsgi.py ---
+
+"""
+WSGI config for example_project project.
+
+It exposes the WSGI callable as a module-level variable named ``application``.
+
+For more information on this file, see
+https://docs.djangoproject.com/en/5.0/howto/deployment/wsgi/
+"""
+
+import os
+
+from django.core.wsgi import get_wsgi_application
+
+
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'example_project.settings')
+
+application = get_wsgi_application()
+
+
+--- C:/Users/jarem/python-projects/django-goals\example_project\__init__.py ---
+
